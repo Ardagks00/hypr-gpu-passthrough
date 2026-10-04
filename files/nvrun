@@ -1,0 +1,18 @@
+#!/bin/sh
+# Run a program on the NVIDIA GPU (PRIME render offload):   nvrun <program> [arguments]
+# Installed by hypr-gpu-passthrough. CUDA programs do not need this; graphics programs do.
+# Does not work while the Windows VM is running, because the GPU is in the VM then.
+CONF=/etc/hypr-gpu-passthrough/config
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+export __NV_PRIME_RENDER_OFFLOAD=1
+export __GLX_VENDOR_LIBRARY_NAME=nvidia
+export __VK_LAYER_NV_optimus=NVIDIA_only
+export VK_LOADER_DRIVERS_SELECT='*nvidia*'
+# NVIDIA's EGL vendor file is kept out of the default search path; add it back for this program.
+if [ -n "${NVIDIA_EGL_JSON:-}" ] && [ -e "$NVIDIA_EGL_JSON" ]; then
+  export __EGL_VENDOR_LIBRARY_FILENAMES="$NVIDIA_EGL_JSON:/usr/share/glvnd/egl_vendor.d/50_mesa.json"
+fi
+# The installer keeps GTK 4 off Vulkan by default (GDK_DISABLE=vulkan); allow it again here.
+unset GDK_DISABLE
+exec "$@"

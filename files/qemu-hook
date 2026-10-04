@@ -1,0 +1,124 @@
+#!/bin/bash
+# hypr-gpu-passthrough — libvirt QEMU hook.
+# Hands the NVIDIA GPU from Linux to the VM when it starts and back when it stops.
+# libvirt binds the card to vfio-pci itself (hostdev managed="yes"); this hook only manages the
+# NVIDIA services and kernel modules around that, plus CPU isolation and the power profile.
+# Installed as /etc/libvirt/hooks/qemu.d/hypr-gpu-passthrough. Settings: /etc/hypr-gpu-passthrough/config
+# Log: journalctl -t hypr-gpu-passthrough
+
+CONF=/etc/hypr-gpu-passthrough/config
+[[ -r $CONF ]] || exit 0
+# shellcheck disable=SC1090
+. "$CONF"
+[[ ${1:-} == "${VM_NAME:-}" ]] || exit 0
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C
+set -uo pipefail
+
+DOMXML=$(cat)   # libvirt passes the domain XML on stdin
+RUN=/run/libvirt/hypr-gpu-passthrough
+STATE=$RUN/services
+PROFILE_STATE=$RUN/profile
+# While the VM owns the card, no NVIDIA module may load: a failed load (vfio-pci holds the device)
+# makes NVIDIA's udev rules retry endlessly.
+BLOCK=/run/modprobe.d/hypr-gpu-passthrough.conf
+MODULES=(nvidia_drm nvidia_modeset nvidia_uvm nvidia)
+SLICES=(user.slice system.slice init.scope)
+read -r -a SERVICES <<< "${NVIDIA_SERVICES:-}"
+
+# Lines on stderr show up in libvirt's error message when the VM refuses to start.
+log() { logger -t hypr-gpu-passthrough -- "$*"; echo "$*" >&2; }
+
+dgpu_nodes() {
+  local n
+  for n in /dev/nvidia* "/dev/dri/by-path/pci-$DGPU-card" "/dev/dri/by-path/pci-$DGPU-render"; do
+    [[ -e $n ]] && readlink -f "$n"
+  done
+}
+
+start_services() {
+  local s
+  for s in "$@"; do
+    [[ -n $s ]] || continue
+    systemctl reset-failed "$s" 2> /dev/null   # repeated attempts must not hit systemd's start limit
+    systemctl start "$s" || log "Warning: could not start $s"
+  done
+}
+
+restore_driver() {
+  rm -f "$BLOCK"
+  modprobe nvidia_drm || log "Warning: could not load nvidia_drm"
+  # nvidia-persistenced is wanted by udev and has StopWhenUnneeded=true: start it only after udev
+  # has registered the driver, or systemd stops it again right away.
+  udevadm settle --timeout=10
+}
+
+case "${2:-}/${3:-}" in
+prepare/begin)
+  mkdir -p "$RUN"
+  active=()
+  for s in "${SERVICES[@]}"; do systemctl is-active --quiet "$s" && active+=("$s"); done
+  printf '%s\n' "${active[@]}" > "$STATE"
+
+  # VFIO pins all guest memory. Refuse clearly instead of letting the OOM killer end QEMU.
+  vm_kib=$(grep -o "<memory unit='KiB'>[0-9]*" <<< "$DOMXML" | grep -o '[0-9]*$' | head -n 1)
+  if [[ -n $vm_kib ]]; then
+    avail_kib=$(awk '/^(MemAvailable|SwapFree):/ {s += $2} END {print s}' /proc/meminfo)
+    need_kib=$(( vm_kib + 1048576 ))
+    if (( avail_kib < need_kib )); then
+      log "Not enough memory to start $VM_NAME: about $(( need_kib / 1048576 )) GiB needed, $(( avail_kib / 1048576 )) GiB available (RAM + swap). Close large applications and try again."
+      exit 1
+    fi
+  fi
+
+  (( ${#active[@]} )) && systemctl stop "${active[@]}"
+
+  mapfile -t nodes < <(dgpu_nodes)
+  if (( ${#nodes[@]} )) && fuser -s "${nodes[@]}" 2> /dev/null; then
+    pids=$(fuser "${nodes[@]}" 2> /dev/null | tr -cs '0-9' ' ')
+    start_services "${active[@]}"
+    log "The NVIDIA GPU is in use, $VM_NAME was not started. Close these programs and try again:"
+    for p in $pids; do ps -o pid=,user=,comm= -p "$p"; done | sort -u | while read -r line; do log "  $line"; done
+    exit 1
+  fi
+
+  mkdir -p "$(dirname "$BLOCK")"
+  printf 'install %s /bin/false\n' "${MODULES[@]}" > "$BLOCK"
+  for m in "${MODULES[@]}"; do
+    [[ -d /sys/module/$m ]] || continue   # modprobe -r may already have removed it as a dependency
+    if ! modprobe -r "$m"; then
+      log "Could not unload $m; $VM_NAME was not started."
+      restore_driver
+      start_services "${active[@]}"
+      exit 1
+    fi
+  done
+  log "$VM_NAME: NVIDIA modules unloaded, handing the GPU to the VM."
+
+  # Linux programs stay off the VM's cores while it runs.
+  if [[ -n ${HOST_CPUS:-} ]]; then
+    for u in "${SLICES[@]}"; do systemctl set-property --runtime -- "$u" AllowedCPUs="$HOST_CPUS"; done
+    log "$VM_NAME: Linux limited to CPUs $HOST_CPUS while the VM runs."
+  fi
+  if command -v powerprofilesctl > /dev/null && powerprofilesctl get > "$PROFILE_STATE" 2> /dev/null; then
+    powerprofilesctl set performance || log "Warning: could not switch to the performance power profile"
+  fi
+  ;;
+
+release/end)
+  restore_driver
+  active=("${SERVICES[@]}")
+  [[ -f $STATE ]] && mapfile -t active < "$STATE"
+  start_services "${active[@]}"
+  rm -f "$STATE"
+  for u in "${SLICES[@]}"; do systemctl set-property --runtime -- "$u" AllowedCPUs=; done
+  if [[ -s $PROFILE_STATE ]]; then
+    powerprofilesctl set "$(cat "$PROFILE_STATE")" || log "Warning: could not restore the power profile"
+  fi
+  rm -f "$PROFILE_STATE"
+  log "$VM_NAME: the GPU is back on Linux."
+  ;;
+esac
+
+exit 0

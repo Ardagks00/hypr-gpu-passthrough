@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Start the GPU passthrough VM if needed and open Looking Glass. When the window closes, offer to
+# shut the VM down so the NVIDIA GPU and the memory return to Linux.
+# Installed by hypr-gpu-passthrough; settings come from /etc/hypr-gpu-passthrough/config.
+CONF=/etc/hypr-gpu-passthrough/config
+# shellcheck disable=SC1090
+. "$CONF" 2> /dev/null || { echo "Missing $CONF; run the installer first." >&2; exit 1; }
+
+V="virsh -c qemu:///system"
+LG=${LG_CLIENT:-$HOME/.local/bin/looking-glass-client}
+
+state() { LC_ALL=C $V domstate "$VM_NAME" 2> /dev/null; }
+
+notify() { command -v notify-send > /dev/null && notify-send -a "$VM_NAME" -i looking-glass "$@"; }
+
+show_error() {   # show_error TITLE TEXT
+  if command -v kdialog > /dev/null; then kdialog --title "$1" --error "$2"
+  elif command -v zenity > /dev/null; then zenity --error --title "$1" --text "$2"
+  elif command -v hyprland-dialog > /dev/null; then hyprland-dialog --title "$1" --text "$2" --buttons "OK" > /dev/null
+  else notify "$1" "$2"; echo "$2" >&2
+  fi
+}
+
+ask_yes_no() {   # ask_yes_no TITLE TEXT — succeeds on "Yes"
+  if command -v kdialog > /dev/null; then kdialog --title "$1" --yesno "$2"
+  elif command -v zenity > /dev/null; then zenity --question --title "$1" --text "$2"
+  elif command -v hyprland-dialog > /dev/null; then
+    [[ $(hyprland-dialog --title "$1" --text "$2" --buttons "Yes;No") == *Yes* ]]
+  else return 1
+  fi
+}
+
+# Two clients must not read the same shared memory.
+if pgrep -u "$USER" -x looking-glass-c > /dev/null; then
+  notify "Looking Glass is already open"
+  exit 0
+fi
+
+if [[ $(state) != running ]]; then
+  notify "Starting $VM_NAME" "The NVIDIA GPU is moving to the VM…"
+  # The hook explains refusals (not enough memory, programs using the GPU) in this output.
+  if ! out=$($V start "$VM_NAME" 2>&1); then
+    show_error "$VM_NAME could not start" "$out"
+    exit 1
+  fi
+fi
+
+"$LG" "$@"
+
+if [[ $(state) == running ]] &&
+   ask_yes_no "$VM_NAME" $'Looking Glass was closed. Shut down the VM as well?\n\nThe NVIDIA GPU and the memory return to Linux after it stops.'; then
+  $V shutdown "$VM_NAME" > /dev/null && notify "Shutting down $VM_NAME" "The GPU returns to Linux when the VM has stopped."
+fi
